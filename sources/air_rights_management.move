@@ -1,9 +1,20 @@
 module air_rights_management::air_rights_nft;
 
-use iota::coin::Coin;
+use iota::coin::{Self, Coin, TreasuryCap};
 use iota::event;
 use iota::iota::IOTA;
+use iota::token::{Self, Token, TokenPolicy};
 use std::string;
+
+// =================== CLT Token Structures ===================
+
+/// The OTW for the AIR_CREDITS Token / Coin.
+public struct AIR_CREDITS has drop {}
+
+/// This is the Rule requirement for the Air Rights Shop.
+public struct AirRightsShop has drop {}
+
+// =================== Original Structures ===================
 
 public struct AirRightsNFT has key, store {
     id: UID,
@@ -42,6 +53,8 @@ public struct AirRightsRegistry has key, store {
     registered_corporations: vector<address>,
 }
 
+// =================== Events ===================
+
 public struct AirRightsPurchasedSuccessfully has copy, drop {
     location: string::String,
     area_coverage_sqm: u64,
@@ -57,7 +70,20 @@ public struct CorporationRegistered has copy, drop {
     message: string::String,
 }
 
-// Error codes
+public struct AirCreditsRewarded has copy, drop {
+    recipient: address,
+    amount: u64,
+    reason: string::String,
+}
+
+public struct AirCreditsPurchase has copy, drop {
+    buyer: address,
+    location: string::String,
+    credits_spent: u64,
+}
+
+// =================== Error Codes ===================
+
 #[error]
 const NOT_ENOUGH_FUNDS: vector<u8> = b"Insufficient funds for air rights purchase";
 #[error]
@@ -77,6 +103,10 @@ const AIR_RIGHTS_NOT_TRANSFERABLE: vector<u8> = b"These air rights cannot be tra
 const AIR_RIGHTS_EXPIRED: vector<u8> = b"Air rights have expired";
 #[error]
 const CORPORATION_NOT_REGISTERED: vector<u8> = b"Corporation must be registered first";
+#[error]
+const INSUFFICIENT_AIR_CREDITS: vector<u8> = b"Insufficient AIR_CREDITS for purchase";
+
+// =================== Initialization ===================
 
 fun init(ctx: &mut TxContext) {
     let sender = ctx.sender();
@@ -95,6 +125,88 @@ fun init(ctx: &mut TxContext) {
         registered_corporations: vector::empty<address>(),
     })
 }
+
+/// Initialize the AIR_CREDITS CLT system
+public fun init_air_credits_token(otw: AIR_CREDITS, ctx: &mut TxContext) {
+    let (treasury_cap, coin_metadata) = coin::create_currency(
+        otw,
+        2, // 2 decimals for credits
+        b"ACRED", // symbol
+        b"Air Credits", // name
+        b"Closed Loop Token for Air Rights Management", // description
+        option::none(), // url
+        ctx,
+    );
+
+    let (mut policy, policy_cap) = token::new_policy(&treasury_cap, ctx);
+
+    // Add rule for spending - only within AirRightsShop
+    token::add_rule_for_action<AIR_CREDITS, AirRightsShop>(
+        &mut policy,
+        &policy_cap,
+        token::spend_action(),
+        ctx,
+    );
+
+    // Add rule for transfer - require treasury approval
+    token::add_rule_for_action<AIR_CREDITS, AirRightsShop>(
+        &mut policy,
+        &policy_cap,
+        token::transfer_action(),
+        ctx,
+    );
+
+    transfer::public_share_object(treasury_cap);
+    token::share_policy(policy);
+    transfer::public_freeze_object(coin_metadata);
+    transfer::public_transfer(policy_cap, tx_context::sender(ctx));
+}
+
+// =================== CLT Reward Functions ===================
+
+/// Reward users with AIR_CREDITS for various actions
+public(package) fun reward_air_credits(
+    cap: &mut TreasuryCap<AIR_CREDITS>,
+    amount: u64,
+    recipient: address,
+    reason: string::String,
+    ctx: &mut TxContext,
+) {
+    let token = token::mint(cap, amount, ctx);
+    let req = token::transfer(token, recipient, ctx);
+    token::confirm_with_treasury_cap(cap, req, ctx);
+
+    event::emit(AirCreditsRewarded {
+        recipient,
+        amount,
+        reason,
+    });
+}
+
+/// Government rewards corporations for compliance or early adoption
+public fun reward_corporation_compliance(
+    _: &GovernmentCap,
+    cap: &mut TreasuryCap<AIR_CREDITS>,
+    corporation: address,
+    amount: u64,
+    registry: &AirRightsRegistry,
+    ctx: &mut TxContext,
+) {
+    assert!(
+        vector::contains(&registry.registered_corporations, &corporation),
+        CORPORATION_NOT_REGISTERED,
+    );
+
+    reward_air_credits(
+        cap,
+        amount,
+        corporation,
+        string::utf8(b"Compliance reward"),
+        ctx,
+    );
+}
+
+// =================== Original Air Rights Functions ===================
 
 #[allow(lint(self_transfer))]
 public fun mint_air_rights(
@@ -117,7 +229,6 @@ public fun mint_air_rights(
     assert!(expiry_date > issue_date, AIR_RIGHTS_EXPIRED);
 
     let name: string::String = string::utf8(b"Air Rights NFT");
-
     let mut whitelisted_corporations = vector::empty<address>();
 
     let nft = AirRightsNFT {
@@ -138,7 +249,6 @@ public fun mint_air_rights(
     };
 
     set_total_zones(registry.total_zones - 1, registry);
-
     transfer::public_transfer(nft, sender);
 }
 
@@ -165,6 +275,145 @@ public fun enable_air_rights_for_sale(
 ) {
     vector::push_back(&mut registry.available_air_rights, nft);
 }
+
+// =================== Enhanced Purchase Functions ===================
+
+/// Purchase air rights with IOTA and earn AIR_CREDITS as rewards
+#[allow(lint(self_transfer))]
+public fun purchase_air_rights_with_iota(
+    coin: &mut Coin<IOTA>,
+    target_location: string::String,
+    target_area: u64,
+    registry: &mut AirRightsRegistry,
+    air_credits_cap: &mut TreasuryCap<AIR_CREDITS>,
+    ctx: &mut TxContext,
+) {
+    let sender = tx_context::sender(ctx);
+    assert!(
+        vector::contains(&registry.registered_corporations, &sender),
+        CORPORATION_NOT_REGISTERED,
+    );
+
+    let mut i = 0;
+    let length = vector::length(&registry.available_air_rights);
+
+    while (i < length) {
+        let current_nft = vector::borrow(&registry.available_air_rights, i);
+        if (
+            current_nft.location_coordinates == target_location && 
+            current_nft.area_coverage_sqm == target_area
+        ) {
+            let mut purchased_nft = vector::remove(&mut registry.available_air_rights, i);
+
+            assert!(
+                vector::contains(&purchased_nft.whitelisted_corporations, &sender),
+                NOT_AUTHORISED_CORPORATION,
+            );
+            assert!(
+                purchased_nft.expiry_date > tx_context::epoch_timestamp_ms(ctx),
+                AIR_RIGHTS_EXPIRED,
+            );
+
+            let payment = coin.split(purchased_nft.price, ctx);
+            transfer::public_transfer(payment, purchased_nft.government_authority);
+            purchased_nft.corporation_owner = sender;
+
+            // Reward with AIR_CREDITS (10% of purchase price as credits)
+            let credit_reward = purchased_nft.price / 10;
+            reward_air_credits(
+                air_credits_cap,
+                credit_reward,
+                sender,
+                string::utf8(b"Air rights purchase reward"),
+                ctx,
+            );
+
+            event::emit(AirRightsPurchasedSuccessfully {
+                location: purchased_nft.location_coordinates,
+                area_coverage_sqm: purchased_nft.area_coverage_sqm,
+                height_range: purchased_nft.height_range_meters,
+                corporation_owner: purchased_nft.corporation_owner,
+                expiry_date: purchased_nft.expiry_date,
+                message: string::utf8(b"Air Rights NFT purchased successfully with IOTA"),
+            });
+
+            transfer::public_transfer(purchased_nft, sender);
+            break
+        };
+        i = i + 1;
+    };
+    assert!(i < length, INVALID_AIR_RIGHTS_PURCHASE);
+}
+
+public fun purchase_air_rights_with_credits(
+    payment: Token<AIR_CREDITS>,
+    target_location: string::String,
+    target_area: u64,
+    registry: &mut AirRightsRegistry,
+    air_credits_cap: &mut TreasuryCap<AIR_CREDITS>,
+    ctx: &mut TxContext,
+) {
+    let sender = tx_context::sender(ctx);
+    assert!(
+        vector::contains(&registry.registered_corporations, &sender),
+        CORPORATION_NOT_REGISTERED,
+    );
+
+    let mut i = 0;
+    let length = vector::length(&registry.available_air_rights);
+
+    while (i < length) {
+        let current_nft = vector::borrow(&registry.available_air_rights, i);
+        if (
+            current_nft.location_coordinates == target_location && 
+            current_nft.area_coverage_sqm == target_area
+        ) {
+            let mut purchased_nft = vector::remove(&mut registry.available_air_rights, i);
+
+            assert!(
+                vector::contains(&purchased_nft.whitelisted_corporations, &sender),
+                NOT_AUTHORISED_CORPORATION,
+            );
+            assert!(
+                purchased_nft.expiry_date > tx_context::epoch_timestamp_ms(ctx),
+                AIR_RIGHTS_EXPIRED,
+            );
+
+            let discounted_price = (purchased_nft.price * 80) / 100;
+            let credits_amount = payment.value();
+            assert!(credits_amount >= discounted_price, INSUFFICIENT_AIR_CREDITS);
+
+            purchased_nft.corporation_owner = sender;
+
+            event::emit(AirCreditsPurchase {
+                buyer: sender,
+                location: purchased_nft.location_coordinates,
+                credits_spent: credits_amount,
+            });
+
+            event::emit(AirRightsPurchasedSuccessfully {
+                location: purchased_nft.location_coordinates,
+                area_coverage_sqm: purchased_nft.area_coverage_sqm,
+                height_range: purchased_nft.height_range_meters,
+                corporation_owner: purchased_nft.corporation_owner,
+                expiry_date: purchased_nft.expiry_date,
+                message: string::utf8(b"Air Rights NFT purchased successfully with AIR_CREDITS"),
+            });
+
+            // ✅ Properly consume the token
+            token::burn(air_credits_cap, payment);
+            transfer::public_transfer(purchased_nft, sender);
+            return;
+        };
+        i = i + 1;
+    };
+
+    // 🔥 No match found, must consume the token anyway to avoid linear type error
+    token::burn(air_credits_cap, payment);
+    assert!(false, INVALID_AIR_RIGHTS_PURCHASE);
+}
+
+// =================== Original Functions (Maintained) ===================
 
 public fun transfer_air_rights(
     mut nft: AirRightsNFT,
@@ -213,61 +462,6 @@ public fun initiate_air_rights_resale(
         air_rights_nft: nft,
     };
     transfer::public_transfer(initiate_resale, buyer_corporation);
-}
-
-#[allow(lint(self_transfer))]
-public fun purchase_air_rights(
-    coin: &mut Coin<IOTA>,
-    target_location: string::String,
-    target_area: u64,
-    registry: &mut AirRightsRegistry,
-    ctx: &mut TxContext,
-) {
-    let sender = tx_context::sender(ctx);
-    assert!(
-        vector::contains(&registry.registered_corporations, &sender),
-        CORPORATION_NOT_REGISTERED,
-    );
-
-    let mut i = 0;
-    let length = vector::length(&registry.available_air_rights);
-
-    while (i < length) {
-        let current_nft = vector::borrow(&registry.available_air_rights, i);
-        if (
-            current_nft.location_coordinates == target_location && current_nft.area_coverage_sqm == target_area
-        ) {
-            let mut purchased_nft = vector::remove(&mut registry.available_air_rights, i);
-
-            assert!(
-                vector::contains(&purchased_nft.whitelisted_corporations, &sender),
-                NOT_AUTHORISED_CORPORATION,
-            );
-            assert!(
-                purchased_nft.expiry_date > tx_context::epoch_timestamp_ms(ctx),
-                AIR_RIGHTS_EXPIRED,
-            );
-
-            let payment = coin.split(purchased_nft.price, ctx);
-            transfer::public_transfer(payment, purchased_nft.government_authority);
-
-            purchased_nft.corporation_owner = sender;
-
-            event::emit(AirRightsPurchasedSuccessfully {
-                location: purchased_nft.location_coordinates,
-                area_coverage_sqm: purchased_nft.area_coverage_sqm,
-                height_range: purchased_nft.height_range_meters,
-                corporation_owner: purchased_nft.corporation_owner,
-                expiry_date: purchased_nft.expiry_date,
-                message: string::utf8(b"Air Rights NFT purchased successfully"),
-            });
-
-            transfer::public_transfer(purchased_nft, sender);
-            break
-        };
-        i = i + 1;
-    };
-    assert!(i < length, INVALID_AIR_RIGHTS_PURCHASE);
 }
 
 #[allow(lint(self_transfer))]
@@ -364,7 +558,8 @@ public fun update_air_rights_transferability(
     nft.is_transferable = transferable;
 }
 
-// View functions
+// =================== View Functions ===================
+
 public fun get_air_rights_info(
     nft: &AirRightsNFT,
 ): (
